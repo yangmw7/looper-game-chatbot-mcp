@@ -1,4 +1,4 @@
-# langchain_mcp_server.py - FIXED
+# langchain_mcp_server.py - FIXED + Team Info
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import asyncio
@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LangChain + MCP Vector Chatbot", version="3.0.0")
+app = FastAPI(title="LangChain + MCP Vector Chatbot", version="3.1.0")
 
 # 전역 변수
 mcp_server: Optional[MariaDBServer] = None
@@ -82,9 +82,11 @@ class VectorSearchService:
             if not pool:
                 raise Exception("DB 연결 풀이 초기화되지 않았습니다")
             
+            documents = []
+            
             async with pool.acquire() as conn:
                 async with conn.cursor() as cursor:
-                    # items와 item_names, item_descriptions 조인
+                    # ========== 1. 아이템 데이터 로드 ==========
                     await cursor.execute("""
                         SELECT 
                             i.id,
@@ -108,6 +110,14 @@ class VectorSearchService:
                         FROM item_attributes
                     """)
                     attributes = await cursor.fetchall()
+                    
+                    # ========== 2. 팀 정보 데이터 로드 ==========
+                    await cursor.execute("""
+                        SELECT name, role, emoji
+                        FROM team_members
+                        ORDER BY id
+                    """)
+                    team_members = await cursor.fetchall()
             
             # 아이템별 속성 매핑
             item_attrs = {}
@@ -121,8 +131,7 @@ class VectorSearchService:
                     'value': attr[3]
                 })
             
-            # Document 생성
-            documents = []
+            # ========== 아이템 Document 생성 ==========
             for item in items:
                 item_id = item[0]
                 name_ko = item[4] or "이름 없음"
@@ -158,10 +167,30 @@ class VectorSearchService:
                         "name_en": name_en,
                         "rarity": rarity,
                         "attributes": attrs,
-                        "source": "items_table"
+                        "source": "items_table",
+                        "type": "item"
                     }
                 )
                 documents.append(doc)
+            
+            # ========== 팀 정보 Document 생성 ==========
+            if team_members:
+                team_content = "🤝 개발팀 정보\n\n"
+                for member in team_members:
+                    name = member[0]
+                    role = member[1]
+                    emoji = member[2] or ""
+                    team_content += f"{emoji} {name}: {role}\n"
+                
+                team_doc = Document(
+                    page_content=team_content,
+                    metadata={
+                        "source": "team_members",
+                        "type": "team_info"
+                    }
+                )
+                documents.append(team_doc)
+                logger.info(f"팀 정보 문서 추가: {len(team_members)}명")
             
             self.documents_cache = documents
             
@@ -171,7 +200,7 @@ class VectorSearchService:
                     documents,
                     self.embeddings
                 )
-                logger.info(f"벡터 스토어 생성 완료: {len(documents)}개 문서")
+                logger.info(f"벡터 스토어 생성 완료: {len(documents)}개 문서 (아이템 + 팀 정보)")
             else:
                 logger.warning("문서가 없어서 벡터 스토어를 생성하지 못했습니다")
                 
@@ -203,12 +232,42 @@ class DirectSQLSearcher:
     async def search(self, query: str, k: int = 3) -> List[Document]:
         """간단한 LIKE 검색"""
         try:
-            # 🔥 수정: self.mcp_server.pool 직접 사용
             pool = self.mcp_server.pool
             documents = []
             
+            # 팀 정보 관련 키워드 체크
+            team_keywords = ['개발자', '팀', '멤버', '구성원', '누가', '누구', '만든', '제작']
+            is_team_query = any(keyword in query for keyword in team_keywords)
+            
             async with pool.acquire() as conn:
                 async with conn.cursor() as cursor:
+                    # 팀 정보 검색
+                    if is_team_query:
+                        await cursor.execute("""
+                            SELECT name, role, emoji
+                            FROM team_members
+                            ORDER BY id
+                        """)
+                        team_results = await cursor.fetchall()
+                        
+                        if team_results:
+                            team_content = "🤝 개발팀 정보\n\n"
+                            for member in team_results:
+                                name = member[0]
+                                role = member[1]
+                                emoji = member[2] or ""
+                                team_content += f"{emoji} {name}: {role}\n"
+                            
+                            doc = Document(
+                                page_content=team_content,
+                                metadata={
+                                    "source": "team_members",
+                                    "type": "team_info"
+                                }
+                            )
+                            documents.append(doc)
+                    
+                    # 아이템 검색
                     await cursor.execute("""
                         SELECT DISTINCT i.id, n.value, i.rarity
                         FROM items i
@@ -223,60 +282,63 @@ class DirectSQLSearcher:
                         content = f"아이템: {row[1]} (ID: {row[0]}, 등급: {row[2]})"
                         doc = Document(
                             page_content=content,
-                            metadata={"item_id": row[0], "name": row[1], "rarity": row[2], "source": "direct_sql"}
+                            metadata={
+                                "item_id": row[0],
+                                "name": row[1],
+                                "rarity": row[2],
+                                "source": "direct_sql",
+                                "type": "item"
+                            }
                         )
                         documents.append(doc)
             
-            logger.info(f"직접 SQL 검색 결과: {len(documents)}개")
             return documents
-            
         except Exception as e:
             logger.error(f"직접 SQL 검색 오류: {e}")
             return []
 
-# ==================== 대화형 챗봇 서비스 ====================
+# ==================== 챗봇 서비스 ====================
 class SmartChatService:
-    """벡터 검색과 직접 SQL을 모두 활용하는 스마트 챗봇"""
+    """통합 챗봇 서비스"""
     
     def __init__(self, mcp_server: MariaDBServer, vector_service: VectorSearchService):
         self.mcp_server = mcp_server
         self.vector_service = vector_service
         self.sql_searcher = DirectSQLSearcher(mcp_server)
+        
         self.chat_model = ChatOpenAI(
-            temperature=0.3,
-            model="gpt-4o",
-            max_tokens=600,
-            timeout=30
+            model="gpt-4o-mini",
+            temperature=0.7
         )
         
-        self.prompt_template = PromptTemplate(
-            input_variables=["history", "context", "input"],
-            template="""당신은 'Looper RPG' 게임의 정확한 게임 가이드 AI입니다.
+        self.prompt_template = PromptTemplate.from_template("""
+당신은 게임 아이템 정보와 개발팀 정보를 안내하는 친절한 AI 어시스턴트입니다.
 
-📋 답변 규칙:
-1. 데이터베이스에 있는 정보만 사용 (절대 추측 금지)
-2. 아이템명, 등급, 능력치 등 구체적 정보 제공
-3. 한글과 영문 이름 모두 언급
-4. 능력치는 정확한 수치로 표시
-
-이전 대화:
+[대화 기록]
 {history}
 
-📊 검색된 게임 데이터:
+[검색된 관련 정보]
 {context}
 
-❓ 사용자 질문: {input}
+[사용자 질문]
+{input}
 
-위 데이터를 바탕으로 정확하게 답변해주세요."""
-        )
+위 정보를 바탕으로 사용자의 질문에 친절하고 정확하게 답변해주세요.
+- 아이템 정보 질문이면 아이템 이름, 등급, 능력치 등을 설명해주세요.
+- 개발팀/개발자 정보 질문이면 팀 구성원과 역할을 안내해주세요.
+- 검색 결과에 없는 내용은 추측하지 마세요.
+- 이모지를 적절히 사용하여 답변을 보기 좋게 작성하세요.
+
+답변:
+""")
     
     async def generate_response(
-        self, 
-        user_query: str, 
-        session_id: str,
+        self,
+        user_query: str,
+        session_id: str = "default",
         use_vector: bool = True
     ) -> Dict[str, Any]:
-        """응답 생성"""
+        """사용자 질문에 대한 응답 생성"""
         try:
             # 1. 검색 방법 선택
             if use_vector and self.vector_service.vector_store:
@@ -289,7 +351,7 @@ class SmartChatService:
             # 2. 검색 결과 없으면 실패
             if not relevant_docs:
                 return {
-                    "answer": "죄송합니다. 해당 아이템에 대한 정보를 찾을 수 없습니다. 다른 키워드로 검색해보세요!",
+                    "answer": "죄송합니다. 해당 정보를 찾을 수 없습니다. 다른 키워드로 검색해보세요!",
                     "search_method": search_method,
                     "sources": []
                 }
@@ -328,15 +390,21 @@ class SmartChatService:
                 conversation_memories[session_id] = conversation_memories[session_id][-20:]
             
             # 8. 소스 정보 구성
-            sources = [
-                {
-                    "item_id": doc.metadata.get("item_id"),
-                    "name": doc.metadata.get("name_ko"),
-                    "rarity": doc.metadata.get("rarity"),
-                    "source": doc.metadata.get("source")
-                }
-                for doc in relevant_docs[:3]
-            ]
+            sources = []
+            for doc in relevant_docs[:3]:
+                if doc.metadata.get("type") == "team_info":
+                    sources.append({
+                        "type": "team_info",
+                        "source": "team_members"
+                    })
+                else:
+                    sources.append({
+                        "item_id": doc.metadata.get("item_id"),
+                        "name": doc.metadata.get("name_ko"),
+                        "rarity": doc.metadata.get("rarity"),
+                        "source": doc.metadata.get("source"),
+                        "type": "item"
+                    })
             
             return {
                 "answer": answer,
